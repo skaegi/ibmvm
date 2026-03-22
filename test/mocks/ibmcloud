@@ -1,0 +1,457 @@
+#!/usr/bin/env bash
+# Mock ibmcloud CLI for ibmvm tests.
+#
+# State lives in IBMVM_MOCK_DIR (set by test helper).
+# Tests control behavior by writing files:
+#   $MOCK_DIR/instance_<name>_status   — current instance status (or absent = not found)
+#   $MOCK_DIR/instance_<name>_fip      — floating IP address assigned to instance
+#   $MOCK_DIR/rg_<name>                — resource group exists marker
+#   $MOCK_DIR/vpc_<name>               — VPC exists marker
+#   $MOCK_DIR/subnet_<name>            — subnet exists marker
+#   $MOCK_DIR/key_<name>               — SSH key exists marker
+#   $MOCK_DIR/login_fail               — presence causes account show to fail
+
+set -euo pipefail
+
+D="${IBMVM_MOCK_DIR:?IBMVM_MOCK_DIR must be set}"
+mkdir -p "$D"
+
+# Log every call
+echo "ibmcloud $*" >> "$D/calls.log"
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+# Slug-safe name: lower-case, replace - with _
+slug() { echo "$1" | tr '[:upper:]-' '[:lower:]_'; }
+
+# Strip standard output/quiet flags and return remaining positional args
+pos_args() {
+  local -a pos=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --output|-r)                shift 2 2>/dev/null || shift ;;  # flag + value
+      --resource-group-name|--resource-group-id|--zone|--total-ipv4-address-count)
+                                  shift 2 2>/dev/null || shift ;;
+      --address-prefix-management|--image|--keys|--nic|--in|--bm)
+                                  shift 2 2>/dev/null || shift ;;
+      --port-min|--port-max|--remote|--visibility|--owner-type|--key|--status)
+                                  shift 2 2>/dev/null || shift ;;
+      --vpc)                      shift 2 2>/dev/null || shift ;;
+      -q|--quiet|-f|--force|--no-wait) shift ;;
+      *) pos+=("$1"); shift ;;
+    esac
+  done
+  echo "${pos[@]+"${pos[@]}"}"
+}
+
+get_flag() {
+  # get_flag --name arg1 arg2 ...
+  local flag="$1"; shift
+  while [[ $# -gt 0 ]]; do
+    [[ "$1" == "$flag" ]] && { echo "${2:-}"; return; }
+    shift
+  done
+}
+
+instance_json() {
+  local name="$1" status="$2"
+  printf '{"id":"i-%s","name":"%s","status":"%s","profile":{"name":"bx2-2x4"},' \
+         "$name" "$name" "$status"
+  printf '"zone":{"name":"us-south-1"},'
+  printf '"primary_network_interface":{"id":"nic-%s","name":"eth0"},' "$name"
+  printf '"memory":4,"vcpu":{"count":2}}'
+}
+
+# ── dispatch ──────────────────────────────────────────────────────────────────
+
+cmd="$1"; shift || true
+
+case "$cmd" in
+
+  # ── login ────────────────────────────────────────────────────────────────
+  login)
+    # ibmcloud login --apikey KEY — write a fresh valid token to simulate success
+    local exp=$(( $(date +%s) + 3600 ))
+    local b64payload
+    b64payload=$(printf '{"exp":%d,"account":{"bss":"mock-account-123"}}' "$exp" | base64 | tr '+/' '-_' | tr -d '=\n')
+    mkdir -p "${HOME}/.ibmcloud"
+    printf '{"IAMToken":"Bearer eyJhbGciOiJIUzI1NiJ9.%s.fakesig"}\n' "$b64payload" \
+      > "${HOME}/.ibmcloud/config.json"
+    rm -f "$D/login_fail"
+    echo "OK"
+    ;;
+
+  # ── account ──────────────────────────────────────────────────────────────
+  account)
+    [[ -f "$D/login_fail" ]] && { echo "Not logged in" >&2; exit 1; }
+    subcmd="${1:-show}"; shift || true
+    case "$subcmd" in
+      show) echo '{"account_id":"mock-account-123"}' ;;
+      list) echo '[{"guid":"mock-account-123","name":"Mock Account","state":"ACTIVE","owner_user_id":"user@mock.com"}]' ;;
+      *)    echo '{}' ;;
+    esac
+    ;;
+
+  # ── target ───────────────────────────────────────────────────────────────
+  target)
+    # ibmcloud target -r REGION -q   OR   ibmcloud target --output JSON
+    if [[ "${1:-}" == "-r" ]]; then
+      echo "${2}" > "$D/region"
+      exit 0
+    fi
+    region=$(cat "$D/region" 2>/dev/null || echo "us-south")
+    echo "{\"region\":{\"name\":\"${region}\"},\"account\":{\"guid\":\"mock-account-123\"}}"
+    ;;
+
+  # ── regions ──────────────────────────────────────────────────────────────
+  regions)
+    echo '[{"Name":"us-south"}]'
+    ;;
+
+  # ── resource ─────────────────────────────────────────────────────────────
+  resource)
+    subcmd="$1"; shift || true
+    case "$subcmd" in
+      group)
+        name="${1:-}"
+        [[ -f "$D/rg_$(slug "$name")" ]] && exit 0 || { echo "Not found" >&2; exit 1; }
+        ;;
+      group-create)
+        name="${1:-}"
+        echo "$name" > "$D/rg_$(slug "$name")"
+        ;;
+      group-delete)
+        name="${1:-}"
+        rm -f "$D/rg_$(slug "$name")"
+        ;;
+      groups)
+        # List all resource groups
+        first=true
+        echo -n "["
+        for rg_file in "$D"/rg_*; do
+          [[ -f "$rg_file" ]] || continue
+          rg_name=$(cat "$rg_file" 2>/dev/null)
+          [[ -z "$rg_name" ]] && continue
+          $first || echo -n ","
+          echo -n "{\"name\":\"${rg_name}\"}"
+          first=false
+        done
+        echo "]"
+        ;;
+    esac
+    ;;
+
+  # ── is ───────────────────────────────────────────────────────────────────
+  is)
+    subcmd="$1"; shift || true
+    read -ra pargs <<< "$(pos_args "$@")" 2>/dev/null || pargs=()
+
+    case "$subcmd" in
+
+      # instance <name>
+      instance)
+        name="${pargs[0]:-}"
+        sf="$D/instance_$(slug "$name")_status"
+        if [[ -f "$sf" ]]; then
+          instance_json "$name" "$(cat "$sf")"
+        else
+          echo '{"errors":[{"message":"Instance not found"}]}'; exit 1
+        fi
+        ;;
+
+      # instances
+      instances)
+        # Return JSON array of all known instances
+        first=true
+        echo -n "["
+        for sf in "$D"/instance_*_status; do
+          [[ -f "$sf" ]] || continue
+          base="${sf##*/instance_}"
+          base="${base%_status}"
+          status=$(cat "$sf")
+          # Prefer original name stored at creation time (preserves dashes)
+          name_file="$D/instance_${base}_name"
+          inst_name=$(cat "$name_file" 2>/dev/null || echo "$base")
+          $first || echo -n ","
+          instance_json "$inst_name" "$status"
+          first=false
+        done
+        echo "]"
+        ;;
+
+      # instance-create <name> <vpc> <zone> <profile> <subnet>
+      instance-create)
+        name="${pargs[0]:-}"
+        echo "running" > "$D/instance_$(slug "$name")_status"
+        echo "$name"   > "$D/instance_$(slug "$name")_name"
+        instance_json "$name" "running"
+        ;;
+
+      # instance-start <name>
+      instance-start)
+        name="${pargs[0]:-}"
+        sf="$D/instance_$(slug "$name")_status"
+        [[ -f "$sf" ]] || { echo "Not found" >&2; exit 1; }
+        echo "running" > "$sf"
+        instance_json "$name" "running"
+        ;;
+
+      # instance-stop <name>
+      instance-stop)
+        name="${pargs[0]:-}"
+        sf="$D/instance_$(slug "$name")_status"
+        [[ -f "$sf" ]] || { echo "Not found" >&2; exit 1; }
+        echo "stopped" > "$sf"
+        instance_json "$name" "stopped"
+        ;;
+
+      # instance-delete <name>
+      instance-delete)
+        name="${pargs[0]:-}"
+        rm -f "$D/instance_$(slug "$name")_status"
+        rm -f "$D/instance_$(slug "$name")_fip"
+        ;;
+
+      # instance-network-interface-floating-ips <instance> <nic>
+      instance-network-interface-floating-ips)
+        instance="${pargs[0]:-}"
+        fip_file="$D/instance_$(slug "$instance")_fip"
+        if [[ -f "$fip_file" ]]; then
+          addr=$(cat "$fip_file")
+          echo "[{\"id\":\"fip-id\",\"address\":\"${addr}\",\"name\":\"${instance}-fip\"}]"
+        else
+          echo "[]"
+        fi
+        ;;
+
+      # floating-ips — list all floating IPs
+      floating-ips)
+        first=true
+        echo -n "["
+        for fip_file in "$D"/instance_*_fip; do
+          [[ -f "$fip_file" ]] || continue
+          addr=$(cat "$fip_file" 2>/dev/null)
+          [[ -z "$addr" ]] && continue
+          base="${fip_file##*/instance_}"
+          base="${base%_fip}"
+          # Prefer original name if available
+          name_file="$D/instance_${base}_name"
+          inst_name=$(cat "$name_file" 2>/dev/null || echo "$base")
+          fip_name="${inst_name}-fip"
+          $first || echo -n ","
+          echo -n "{\"id\":\"fip-${base}\",\"name\":\"${fip_name}\",\"address\":\"${addr}\"}"
+          first=false
+        done
+        echo "]"
+        ;;
+
+      # floating-ip <name>
+      floating-ip)
+        name="${pargs[0]:-}"
+        # Derive instance name from fip name (convention: <instance>-fip)
+        instance="${name%-fip}"
+        fip_file="$D/instance_$(slug "$instance")_fip"
+        if [[ -f "$fip_file" ]]; then
+          addr=$(cat "$fip_file")
+          echo "{\"id\":\"fip-id\",\"address\":\"${addr}\",\"name\":\"${name}\"}"
+        else
+          echo '{"errors":[{"message":"not found"}]}'; exit 1
+        fi
+        ;;
+
+      # floating-ip-reserve <fip-name> --nic NIC --in INSTANCE ...
+      floating-ip-reserve)
+        fip_name="${pargs[0]:-}"
+        instance=$(get_flag --in "$@")
+        addr="1.2.3.$(( RANDOM % 200 + 10 ))"
+        [[ -n "$instance" ]] && echo "$addr" > "$D/instance_$(slug "$instance")_fip"
+        echo "{\"id\":\"fip-id\",\"address\":\"${addr}\",\"name\":\"${fip_name}\"}"
+        ;;
+
+      # floating-ip-release <name>
+      floating-ip-release)
+        name="${pargs[0]:-}"
+        instance="${name%-fip}"
+        rm -f "$D/instance_$(slug "$instance")_fip"
+        ;;
+
+      # vpcs — list all VPCs
+      vpcs)
+        first=true
+        echo -n "["
+        for vpc_file in "$D"/vpc_*; do
+          [[ -f "$vpc_file" ]] || continue
+          vpc_name=$(cat "$vpc_file" 2>/dev/null)
+          vpc_slug="${vpc_file##*/vpc_}"
+          [[ -z "$vpc_name" ]] && vpc_name="$vpc_slug"
+          $first || echo -n ","
+          echo -n "{\"id\":\"vpc-${vpc_slug}\",\"name\":\"${vpc_name}\"}"
+          first=false
+        done
+        echo "]"
+        ;;
+
+      # vpc <name>
+      vpc)
+        name="${pargs[0]:-}"
+        [[ -f "$D/vpc_$(slug "$name")" ]] \
+          && echo "{\"id\":\"vpc-$(slug "$name")\",\"name\":\"${name}\"}" \
+          || { echo '{"errors":[{"message":"not found"}]}'; exit 1; }
+        ;;
+
+      # vpc-create <name>
+      vpc-create)
+        name="${pargs[0]:-}"
+        echo "$name" > "$D/vpc_$(slug "$name")"  # store actual name for security-groups lookup
+        echo "{\"id\":\"vpc-$(slug "$name")\",\"name\":\"${name}\"}"
+        ;;
+
+      # subnet <name>
+      subnet)
+        name="${pargs[0]:-}"
+        [[ -f "$D/subnet_$(slug "$name")" ]] \
+          && echo "{\"id\":\"sn-$(slug "$name")\",\"name\":\"${name}\"}" \
+          || { echo '{"errors":[{"message":"not found"}]}'; exit 1; }
+        ;;
+
+      # subnet-create <name> <vpc>
+      subnet-create)
+        name="${pargs[0]:-}"
+        vpc_arg="${pargs[1]:-ibmvm}"
+        printf '%s %s' "$name" "$vpc_arg" > "$D/subnet_$(slug "$name")"
+        echo "{\"id\":\"sn-$(slug "$name")\",\"name\":\"${name}\"}"
+        ;;
+
+      # subnets — list subnets, optionally filtered by --vpc
+      subnets)
+        vpc_filter=$(get_flag --vpc "$@")
+        first=true
+        echo -n "["
+        for sn_file in "$D"/subnet_*; do
+          [[ -f "$sn_file" ]] || continue
+          read -r sn_name sn_vpc <<< "$(cat "$sn_file" 2>/dev/null)" || continue
+          [[ -z "$sn_name" ]] && continue
+          [[ -n "$vpc_filter" ]] && [[ "$sn_vpc" != "$vpc_filter" ]] && continue
+          $first || echo -n ","
+          echo -n "{\"id\":\"sn-$(slug "$sn_name")\",\"name\":\"${sn_name}\",\"vpc\":{\"name\":\"${sn_vpc:-ibmvm}\"},\"zone\":{\"name\":\"us-south-1\"}}"
+          first=false
+        done
+        echo "]"
+        ;;
+
+      # key <name>
+      key)
+        name="${pargs[0]:-}"
+        [[ -f "$D/key_$(slug "$name")" ]] \
+          && echo "{\"id\":\"key-$(slug "$name")\",\"name\":\"${name}\"}" \
+          || { echo '{"errors":[{"message":"not found"}]}'; exit 1; }
+        ;;
+
+      # key-create <name>
+      key-create)
+        name="${pargs[0]:-}"
+        touch "$D/key_$(slug "$name")"
+        echo "{\"id\":\"key-$(slug "$name")\",\"name\":\"${name}\"}"
+        ;;
+
+      # keys (plural) — list cloud-registered keys
+      keys)
+        first=true
+        echo -n "["
+        for key_file in "$D"/key_*; do
+          [[ -f "$key_file" ]] || continue
+          key_slug="${key_file##*/key_}"
+          key_name=$(cat "$key_file" 2>/dev/null)
+          [[ -z "$key_name" ]] && key_name="$key_slug"
+          $first || echo -n ","
+          echo -n "{\"id\":\"key-${key_slug}\",\"name\":\"${key_name}\",\"fingerprint\":\"SHA256:mockfp123\"}"
+          first=false
+        done
+        echo "]"
+        ;;
+
+      # images
+      images)
+        echo '[{"id":"img-ubuntu-001","name":"ibm-ubuntu-24-04-1-minimal-amd64-1","status":"available"},
+               {"id":"img-ubuntu-002","name":"ibm-ubuntu-22-04-3-minimal-amd64-1","status":"available"}]'
+        ;;
+
+      # instance-profiles — list available profiles
+      instance-profiles)
+        echo '[{"name":"bx2-2x8"},{"name":"bx2-4x8"},{"name":"bx2-4x16"},{"name":"cx2-4x8"},{"name":"cx2-8x16"},{"name":"mx2-2x16"}]'
+        ;;
+
+      # instance-profile <name> — look up a single profile
+      instance-profile)
+        name="${pargs[0]:-}"
+        case "$name" in
+          bx2-2x8|bx2-4x8|bx2-4x16|cx2-4x8|cx2-8x16|mx2-2x16)
+            echo "{\"name\":\"${name}\"}"
+            ;;
+          *)
+            echo '{"errors":[{"message":"not found"}]}'; exit 1
+            ;;
+        esac
+        ;;
+
+      # key-delete <id-or-name>
+      key-delete)
+        ref="${pargs[0]:-}"
+        # Accept ID (key-<slug>) or name
+        key_slug="${ref#key-}"
+        rm -f "$D/key_${key_slug}" "$D/key_$(slug "$ref")"
+        ;;
+
+      # subnet-delete <id-or-name>
+      subnet-delete)
+        ref="${pargs[0]:-}"
+        # Accept ID (sn-<slug>) or name
+        sn_slug="${ref#sn-}"
+        rm -f "$D/subnet_${sn_slug}" "$D/subnet_$(slug "$ref")"
+        ;;
+
+      # vpc-delete <id-or-name>
+      vpc-delete)
+        ref="${pargs[0]:-}"
+        # Accept ID (vpc-<slug>) or name
+        vpc_slug="${ref#vpc-}"
+        rm -f "$D/vpc_${vpc_slug}" "$D/vpc_$(slug "$ref")"
+        ;;
+
+      # security-groups — dynamically built from all vpc_* state files
+      security-groups)
+        first=true
+        echo -n "["
+        for vpc_file in "$D"/vpc_*; do
+          [[ -f "$vpc_file" ]] || continue
+          vpc_name=$(cat "$vpc_file" 2>/dev/null)
+          vpc_slug="${vpc_file##*/vpc_}"
+          [[ -z "$vpc_name" ]] && vpc_name="$vpc_slug"  # empty file → use slug as name
+          $first || echo -n ","
+          echo -n "{\"id\":\"sg-${vpc_slug}\",\"name\":\"${vpc_name}-sg\",\"vpc\":{\"name\":\"${vpc_name}\"}}"
+          first=false
+        done
+        echo "]"
+        ;;
+
+      # security-group-rules <sg-id>
+      security-group-rules)
+        sg="${pargs[0]:-}"
+        rules_file="$D/sg_${sg}_rules"
+        [[ -f "$rules_file" ]] && cat "$rules_file" || echo "[]"
+        ;;
+
+      # security-group-rule-add <sg> inbound tcp --port-min 22 --port-max 22
+      security-group-rule-add)
+        sg="${pargs[0]:-}"
+        echo "[{\"id\":\"rule-ssh\",\"direction\":\"inbound\",\"protocol\":\"tcp\",\"port_min\":22,\"port_max\":22}]" \
+          > "$D/sg_${sg}_rules"
+        echo "{\"id\":\"rule-ssh\"}"
+        ;;
+
+      *) echo "{}" ;;
+    esac
+    ;;
+
+  *) exit 0 ;;
+esac

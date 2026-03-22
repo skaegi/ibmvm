@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+D="${IBMVM_MOCK_DIR:?}"
+echo "ssh-keygen $*" >> "$D/calls.log"
+# Handle -lf fingerprint lookup (always returns same mock fingerprint)
+if [[ "${1:-}" == "-lf" ]]; then
+  echo "256 SHA256:mockfp123 test@ibmvm (ED25519)"
+fi

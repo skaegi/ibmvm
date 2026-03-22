@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Mock ssh — logs the call so tests can assert on it, then exits cleanly.
+D="${IBMVM_MOCK_DIR:?IBMVM_MOCK_DIR must be set}"
+echo "ssh $*" >> "$D/calls.log"
