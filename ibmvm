@@ -40,12 +40,12 @@ die()      { echo -e "${C_RED}✗${C_RST} $*" >&2; exit 1; }
 _capturing() {
   local _var="$1" _msg="$2"; shift 2
   local _tmp; _tmp=$(mktemp)
-  printf '  %s' "$_msg"
+  printf '  %s' "$_msg" >&2
   "$@" > "$_tmp" 2>/dev/null &
   local _pid=$!
-  while kill -0 "$_pid" 2>/dev/null; do printf '.'; sleep 2; done
+  while kill -0 "$_pid" 2>/dev/null; do printf '.' >&2; sleep 2; done
   wait "$_pid" || true
-  printf '\n'
+  printf '\n' >&2
   printf -v "$_var" '%s' "$(cat "$_tmp")"
   rm -f "$_tmp"
 }
