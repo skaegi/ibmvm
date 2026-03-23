@@ -19,6 +19,7 @@ VPC_NAME="ibmvm-vpc"
 SUBNET_NAME="ibmvm-subnet"
 KEY_NAME="ibmvm-key"
 VM_PREFIX="ibmvm-"
+ACCESS_SG_NAME="ibmvm-access"
 
 # ── Colors ────────────────────────────────────────────────────────────────────
 if [[ -t 1 ]]; then
@@ -32,6 +33,22 @@ log_info() { echo -e "${C_BLU}→${C_RST} $*"; }
 log_ok()   { echo -e "${C_GRN}✓${C_RST} $*"; }
 log_warn() { echo -e "${C_YEL}⚠${C_RST} $*"; }
 die()      { echo -e "${C_RED}✗${C_RST} $*" >&2; exit 1; }
+
+# Run a command in the background showing dots until it finishes.
+# Captures stdout into the named variable; stderr is discarded.
+# Usage: _capturing varname "Label..." cmd [args...]
+_capturing() {
+  local _var="$1" _msg="$2"; shift 2
+  local _tmp; _tmp=$(mktemp)
+  printf '  %s' "$_msg"
+  "$@" > "$_tmp" 2>/dev/null &
+  local _pid=$!
+  while kill -0 "$_pid" 2>/dev/null; do printf '.'; sleep 2; done
+  wait "$_pid" || true
+  printf '\n'
+  printf -v "$_var" '%s' "$(cat "$_tmp")"
+  rm -f "$_tmp"
+}
 
 confirm() {
   # Usage: confirm "message" → returns 0 (yes) or 1 (no)
@@ -194,6 +211,32 @@ ic_id() {
   ic "$1" | jq -r --arg n "$2" '.[] | select(.name == $n) | .id // empty' 2>/dev/null | head -1
 }
 
+# Get the caller's current public IP address.
+my_ip() {
+  local ip
+  ip=$(curl -s --max-time 5 https://ifconfig.me 2>/dev/null) \
+    || die "Could not determine public IP — check your network or specify an IP explicitly"
+  [[ -n "$ip" ]] || die "Could not determine public IP"
+  echo "$ip"
+}
+
+# Given a raw IP address, return the host CIDR (append /32 for IPv4, /128 for IPv6).
+ip_to_cidr() {
+  local ip="$1"
+  # Strip any existing prefix length if caller passed one
+  ip="${ip%%/*}"
+  if [[ "$ip" == *:* ]]; then
+    echo "${ip}/128"
+  else
+    echo "${ip}/32"
+  fi
+}
+
+# Look up the access security group ID by name.
+access_sg_id() {
+  ic_id security-groups "$ACCESS_SG_NAME"
+}
+
 # Look up a floating IP ID by name.
 fip_id() {
   ic floating-ips | jq -r --arg n "$1" '.[] | select(.name == $n) | .id // empty' 2>/dev/null | head -1
@@ -272,33 +315,19 @@ ensure_ssh_key() {
   fi
 }
 
-ensure_sg_ssh_rule() {
-  log_info "SSH inbound rule on VPC security group..."
-
-  local sg_id
-  sg_id=$(ic security-groups \
-    | jq -r --arg vpc "$VPC_NAME" \
-      '[.[] | select(.vpc.name == $vpc)] | first | .id // empty')
-  [[ -n "$sg_id" ]] || die "No security group found for VPC '${VPC_NAME}'"
-
-  local has_ssh
-  has_ssh=$(ic security-group-rules "$sg_id" \
-    | jq '[.[] | select(
-        .direction == "inbound" and
-        .protocol == "tcp" and
-        .port_min <= 22 and
-        .port_max >= 22
-      )] | length')
-
-  if [[ "${has_ssh:-0}" -gt 0 ]]; then
+ensure_sg_access() {
+  log_info "Access security group '${ACCESS_SG_NAME}'..."
+  local existing_id; existing_id=$(access_sg_id)
+  if [[ -n "$existing_id" ]]; then
     log_ok "  exists"
   else
-    log_info "  adding rule..."
-    ibmcloud is security-group-rule-add "$sg_id" inbound tcp \
-      --port-min 22 --port-max 22 \
+    log_info "  creating..."
+    ibmcloud is security-group-create "$ACCESS_SG_NAME" \
+      --vpc "$VPC_NAME" \
+      --resource-group-name "$RG_NAME" \
       --output JSON -q > /dev/null \
-      || die "Failed to add SSH rule to security group"
-    log_ok "  added"
+      || die "Failed to create access security group"
+    log_ok "  created (no rules — use: ibmvm access allow)"
   fi
 }
 
@@ -555,14 +584,10 @@ cmd_setup() {
     fi
   fi
 
-  # Resolve image to an actual ID (IDs start with r<digits>-)
-  if [[ -z "$image" ]] || [[ ! "$image" =~ ^r[0-9]+-[0-9a-f-]+ ]]; then
-    local pattern="${image:-ubuntu-24}"
-    image=$(ic images --visibility public --owner-type provider \
-      | jq -r --arg p "$pattern" \
-        '[.[] | select(.status == "available" and (.name | contains($p)))] | sort_by(.name) | reverse | .[0].id // empty' \
-      || true)
-  fi
+  # Resolve image name/pattern/ID → id + display name
+  local _img_resolved; _img_resolved=$(resolve_image "${image:-ubuntu-24}")
+  image=$(printf '%s' "$_img_resolved" | cut -f1)
+  local image_label; image_label=$(printf '%s' "$_img_resolved" | cut -f2)
 
   local customize=false
   local prompt_label
@@ -573,6 +598,7 @@ cmd_setup() {
     log_info "Proposed configuration:"
     prompt_label="Use these settings?"
   fi
+
   echo ""
   printf "  ${C_BOLD}%-20s${C_RST} %s\n" "Region:"         "$region"
   printf "  ${C_BOLD}%-20s${C_RST} %s\n" "Resource group:" "$rg_name"
@@ -581,7 +607,7 @@ cmd_setup() {
   printf "  ${C_BOLD}%-20s${C_RST} %s\n" "SSH key:"        "$ssh_key_file"
   printf "  ${C_BOLD}%-20s${C_RST} %s\n" "Profile:"        "$profile"
   printf "  ${C_BOLD}%-20s${C_RST} %s\n" "SSH user:"       "$ssh_user"
-  printf "  ${C_BOLD}%-20s${C_RST} %s\n" "Image:"          "$image"
+  printf "  ${C_BOLD}%-20s${C_RST} %s\n" "Image:"          "$image_label"
   echo ""
   confirm_yes "$prompt_label" || customize=true
   echo ""
@@ -636,7 +662,7 @@ cmd_setup() {
   ensure_vpc
   ensure_subnet "$ZONE"
   ensure_ssh_key
-  ensure_sg_ssh_rule
+  ensure_sg_access
 
   SETUP_DONE_REGION="$region"
   save_config
@@ -692,20 +718,23 @@ wait_for_status() {
 }
 
 pick_image() {
-  echo -e "\n  ${C_BOLD}Available images:${C_RST}" >&2
+  echo -e "\n  ${C_BOLD}Available images (public IBM-provided):${C_RST}" >&2
 
+  local _raw
+  _capturing _raw "Fetching images" \
+    ibmcloud is images --visibility public --owner-type provider --output JSON -q
   local images_json
-  images_json=$(ic images --visibility public --owner-type provider \
-    | jq '[.[] | select(.status == "available")] | sort_by(.name) | reverse')
+  images_json=$(printf '%s' "$_raw" | jq '[.[] | select(.status == "available")] | sort_by(.name) | reverse')
 
   local count; count=$(echo "$images_json" | jq 'length')
   [[ "${count:-0}" -gt 0 ]] || die "No available images found."
 
+  local manual_idx=$(( count + 1 ))
   local default_idx=1
   if [[ -n "${IMAGE:-}" ]]; then
     local idx; idx=$(echo "$images_json" | jq --arg id "$IMAGE" \
       'to_entries | map(select(.value.id == $id)) | .[0].key // -1')
-    [[ "$idx" -ge 0 ]] && default_idx=$(( idx + 1 ))
+    [[ "$idx" -ge 0 ]] && default_idx=$(( idx + 1 )) || default_idx="$manual_idx"
   fi
 
   local i=1
@@ -713,15 +742,61 @@ pick_image() {
     printf "    %2d) %s\n" "$i" "$name" >&2
     i=$(( i + 1 ))
   done < <(echo "$images_json" | jq -r '.[].name')
+  printf "    %2d) %s\n" "$manual_idx" "Enter image ID manually…" >&2
 
   echo -en "\n  ${C_BOLD}Image${C_RST} [${C_DIM}${default_idx}${C_RST}]: " >&2
   local reply; read -r reply
   local sel="${reply:-$default_idx}"
 
+  if [[ "$sel" -eq "$manual_idx" ]]; then
+    local custom_id
+    custom_id=$(ask "Image ID" "${IMAGE:-}")
+    [[ -n "$custom_id" ]] || die "No image ID provided."
+    echo "$custom_id"
+    return
+  fi
+
   [[ "$sel" =~ ^[0-9]+$ ]] && [[ "$sel" -ge 1 ]] && [[ "$sel" -le "$count" ]] \
     || die "Invalid image selection: ${sel}"
 
   echo "$images_json" | jq -r ".[$(( sel - 1 ))].id"
+}
+
+# Resolve an image name/pattern/ID to an ID.
+# Prints "<id> <name>" on stdout separated by a tab.
+# Search order: exact ID → public IBM images by pattern → all images by pattern (catches private).
+resolve_image() {
+  local input="$1"
+
+  # Already an ID
+  if [[ "$input" =~ ^r[0-9]+-[0-9a-f-]+ ]]; then
+    local name; name=$(ic image "$input" | jq -r '.name // empty' 2>/dev/null || true)
+    printf '%s\t%s' "$input" "${name:-$input}"
+    return
+  fi
+
+  # Pattern search — public IBM-provided images first (cheap, common case)
+  local images_json
+  _capturing images_json "Fetching images" \
+    ibmcloud is images --visibility public --owner-type provider --output JSON -q
+  local id name
+  id=$(printf '%s' "$images_json" | jq -r --arg p "$input" \
+    '[.[] | select(.status == "available" and (.name | contains($p)))] | sort_by(.name) | reverse | .[0].id // empty')
+  name=$(printf '%s' "$images_json" | jq -r --arg p "$input" \
+    '[.[] | select(.status == "available" and (.name | contains($p)))] | sort_by(.name) | reverse | .[0].name // empty')
+
+  # Fall back to all images (catches private/custom)
+  if [[ -z "$id" ]]; then
+    _capturing images_json "Fetching private images" \
+      ibmcloud is images --output JSON -q
+    id=$(printf '%s' "$images_json" | jq -r --arg p "$input" \
+      '[.[] | select(.status == "available" and (.name | contains($p)))] | sort_by(.name) | reverse | .[0].id // empty')
+    name=$(printf '%s' "$images_json" | jq -r --arg p "$input" \
+      '[.[] | select(.status == "available" and (.name | contains($p)))] | sort_by(.name) | reverse | .[0].name // empty')
+  fi
+
+  [[ -n "$id" ]] || die "No image found matching '${input}'"
+  printf '%s\t%s' "$id" "${name:-$id}"
 }
 
 # List all ibmvm-managed instances (prefixed with VM_PREFIX) in the resource group.
@@ -755,6 +830,95 @@ assign_floating_ip() {
   echo "$fip_json" | jq -r '.address'
 }
 
+# ── Access command ────────────────────────────────────────────────────────────
+
+cmd_access() {
+  local subcmd="${1:-list}"; shift || true
+
+  local sg_id; sg_id=$(access_sg_id)
+  [[ -n "$sg_id" ]] || die "Access security group '${ACCESS_SG_NAME}' not found. Run: ibmvm setup"
+
+  case "$subcmd" in
+    list)
+      local rules; rules=$(ic security-group-rules "$sg_id")
+      local count; count=$(echo "$rules" | jq '[.[] | select(.direction == "inbound" and .protocol == "tcp")] | length')
+      if [[ "${count:-0}" -eq 0 ]]; then
+        log_info "No IPs allowed. Use: ibmvm access allow"
+        return
+      fi
+      local my_cidr=""
+      local pub_ip; pub_ip=$(my_ip 2>/dev/null || true)
+      [[ -n "$pub_ip" ]] && my_cidr=$(ip_to_cidr "$pub_ip")
+
+      printf "${C_BOLD}%s${C_RST}\n" "IP"
+      printf "${C_DIM}%s${C_RST}\n" "--"
+      while IFS= read -r rule; do
+        local cidr display_ip
+        cidr=$(echo "$rule" | jq -r '.remote.cidr_block // .remote.address // "?"')
+        display_ip="${cidr%/32}"; display_ip="${display_ip%/128}"
+        if [[ "$cidr" == "$my_cidr" ]]; then
+          printf "%s  ${C_GRN}← you${C_RST}\n" "$display_ip"
+        else
+          echo "$display_ip"
+        fi
+      done < <(echo "$rules" | jq -c '.[] | select(.direction == "inbound" and .protocol == "tcp")')
+      ;;
+
+    allow)
+      local ip="${1:-}" note="${2:-}"
+      [[ -n "$ip" ]] || { log_info "Detecting public IP..."; ip=$(my_ip); }
+      local cidr; cidr=$(ip_to_cidr "$ip")
+
+      # Skip if rule already exists
+      local existing
+      existing=$(ic security-group-rules "$sg_id" \
+        | jq -r --arg c "$cidr" \
+          '[.[] | select(.direction == "inbound" and .protocol == "tcp" and (.remote.cidr_block // "") == $c)] | length')
+      if [[ "${existing:-0}" -gt 0 ]]; then
+        log_ok "SSH from ${ip} is already allowed."
+        return
+      fi
+
+      ibmcloud is security-group-rule-add "$sg_id" inbound tcp \
+        --port-min 22 --port-max 22 \
+        --remote "$cidr" \
+        --output JSON -q > /dev/null \
+        || die "Failed to add rule for ${cidr}"
+      log_ok "SSH access allowed from ${ip}"
+      ;;
+
+    deny)
+      if [[ "${1:-}" == "--all" ]]; then
+        log_info "Removing all SSH access rules..."
+        local rules; rules=$(ic security-group-rules "$sg_id")
+        local removed=0
+        while IFS= read -r rule_id; do
+          ibmcloud is security-group-rule-delete "$sg_id" "$rule_id" --force -q \
+            || log_warn "Could not remove rule ${rule_id} (continuing)"
+          (( ++removed ))
+        done < <(echo "$rules" | jq -r '.[] | select(.direction == "inbound") | .id')
+        log_ok "Removed ${removed} rule(s) — VM is now locked."
+      else
+        local ip="${1:-}"
+        [[ -n "$ip" ]] || { log_info "Detecting public IP..."; ip=$(my_ip); }
+        local cidr; cidr=$(ip_to_cidr "$ip")
+        local rule_id
+        rule_id=$(ic security-group-rules "$sg_id" \
+          | jq -r --arg c "$cidr" \
+            '.[] | select(.direction == "inbound" and .protocol == "tcp" and (.remote.cidr_block // "") == $c) | .id')
+        [[ -n "$rule_id" ]] || die "No SSH rule found for ${cidr}"
+        ibmcloud is security-group-rule-delete "$sg_id" "$rule_id" --force -q \
+          || die "Failed to remove rule for ${cidr}"
+        log_ok "SSH access removed for ${ip}"
+      fi
+      ;;
+
+    *)
+      die "Unknown subcommand: 'ibmvm access ${subcmd}'  (use: allow, deny, list)"
+      ;;
+  esac
+}
+
 # ── Commands ──────────────────────────────────────────────────────────────────
 cmd_create() {
   local name="$1"; shift
@@ -774,14 +938,12 @@ cmd_create() {
 
   local zone; zone=$(get_zone)
 
-  local image_id
-  if [[ -n "$image_arg" ]]; then
-    image_id="$image_arg"
-  else
-    [[ -n "${IMAGE:-}" ]] || die "No default image configured. Run: ibmvm setup"
-    image_id="$IMAGE"
-  fi
-  log_info "Image: ${image_id}"
+  local _img_input="${image_arg:-${IMAGE:-}}"
+  [[ -n "$_img_input" ]] || die "No image configured. Run: ibmvm setup or pass --image <name|id>"
+  local _img_resolved; _img_resolved=$(resolve_image "$_img_input")
+  local image_id; image_id=$(printf '%s' "$_img_resolved" | cut -f1)
+  local image_name; image_name=$(printf '%s' "$_img_resolved" | cut -f2)
+  log_info "Image: ${image_name}"
 
   local subnet_id key_id
   subnet_id=$(ic_id subnets "$SUBNET_NAME")
@@ -798,6 +960,16 @@ cmd_create() {
     || die "Failed to create instance '${vm}'"
 
   wait_for_status "$vm" "running"
+
+  local access_sg; access_sg=$(access_sg_id)
+  if [[ -n "$access_sg" ]]; then
+    local nic_id; nic_id=$(get_primary_nic_id "$vm")
+    if [[ -n "$nic_id" ]]; then
+      ibmcloud is security-group-target-add "$access_sg" "$nic_id" \
+        --output JSON -q > /dev/null \
+        || log_warn "Could not attach access security group (SSH access rules may not apply)"
+    fi
+  fi
 
   log_info "Assigning floating IP..."
   local ip; ip=$(assign_floating_ip "$vm")
@@ -909,10 +1081,17 @@ cmd_rm() {
       confirm "Also remove all ibmvm infrastructure (VPC, subnet, key, resource group)?" \
         || { log_ok "Done."; exit 0; }
 
-      local key_id subnet_id vpc_id
+      local key_id subnet_id vpc_id access_sg
       key_id=$(ic_id keys "$KEY_NAME")
       subnet_id=$(ic_id subnets "$SUBNET_NAME")
       vpc_id=$(ic_id vpcs "$VPC_NAME")
+      access_sg=$(access_sg_id)
+
+      if [[ -n "$access_sg" ]]; then
+        log_info "Removing access security group '${ACCESS_SG_NAME}'..."
+        ibmcloud is security-group-delete "$access_sg" --force -q \
+          || log_warn "Could not remove access security group (continuing)"
+      fi
 
       log_info "Removing SSH key '${KEY_NAME}'..."
       if [[ -n "$key_id" ]]; then
@@ -945,6 +1124,12 @@ cmd_rm() {
       SETUP_DONE_REGION=""
       save_config
       log_ok "All ibmvm infrastructure removed."
+
+      echo ""
+      if confirm "Also remove local ibmvm config directory (${IBMVM_DIR})?"; then
+        rm -rf "$IBMVM_DIR"
+        log_ok "${IBMVM_DIR} removed."
+      fi
     fi
     return
   fi
@@ -996,6 +1181,29 @@ cmd_ssh() {
 
   local ip; ip=$(get_floating_ip "$name")
   [[ -n "$ip" ]] || die "No floating IP found for '${short_name}'."
+
+  # Check access SG and offer to allow current IP if not already permitted
+  local sg_id; sg_id=$(access_sg_id)
+  if [[ -n "$sg_id" ]]; then
+    local pub_ip
+    pub_ip=$(my_ip 2>/dev/null || true)
+    if [[ -n "$pub_ip" ]]; then
+      local cidr; cidr=$(ip_to_cidr "$pub_ip")
+      local existing
+      existing=$(ic security-group-rules "$sg_id" \
+        | jq -r --arg c "$cidr" \
+          '[.[] | select(.direction == "inbound" and .protocol == "tcp" and (.remote.cidr_block // "") == $c)] | length')
+      if [[ "${existing:-0}" -eq 0 ]]; then
+        confirm_yes "Your IP (${pub_ip}) is not in the allow list. Add it?" || { log_info "Aborted."; exit 0; }
+        ibmcloud is security-group-rule-add "$sg_id" inbound tcp \
+          --port-min 22 --port-max 22 \
+          --remote "$cidr" \
+          --output JSON -q > /dev/null \
+          || die "Failed to add SSH rule for ${pub_ip}"
+        log_ok "SSH access allowed from ${pub_ip}"
+      fi
+    fi
+  fi
 
   log_info "Connecting to ${ssh_user}@${ip}..."
   local tries=0 max=20
@@ -1083,13 +1291,19 @@ ${C_BOLD}COMMANDS${C_RST}
   stop    <name>      Stop a running VM
   rm      <name>      Remove a VM and its floating IP
   rm      --all       Remove all VMs in the resource group (optionally tears down infra)
-  ssh     <name>      SSH into a VM (starts it first if stopped)
+  ssh     <name>      SSH into a VM (starts it first if stopped, auto-allows your IP)
   list                List all VMs in the resource group
   status  <name>      Show VM details
 
+${C_BOLD}ACCESS${C_RST}  (manage which IPs can SSH to your VMs)
+  access list         Show currently allowed IPs
+  access allow [ip]   Allow SSH from an IP (defaults to your current public IP)
+  access deny  [ip]   Remove SSH access for an IP (defaults to your current public IP)
+  access deny --all   Remove all SSH access rules (lock down)
+
 ${C_BOLD}OPTIONS${C_RST}
   --profile <name>    VM profile  (create only, default from setup)
-  --image   <id>      Image ID  (create only, overrides the image chosen during setup)
+  --image   <name>    Image name or pattern  (create only, overrides the image chosen during setup)
 
 ${C_BOLD}EXAMPLES${C_RST}
   ibmvm setup                          # first-time interactive setup
@@ -1148,6 +1362,7 @@ main() {
              cmd_list ;;
     status)  [[ $# -ge 1 ]] || die "Usage: ibmvm status <name>"
              cmd_status "$1" ;;
+    access)  cmd_access "$@" ;;
     *)       die "Unknown command: '${cmd}'  (run 'ibmvm help' for usage)" ;;
   esac
 }
