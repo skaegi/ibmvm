@@ -669,6 +669,7 @@ cmd_setup() {
 
   echo ""
   log_ok "Setup complete. Config saved to ${CONFIG_FILE}"
+  log_info "Run: ibmvm info  to review your configuration"
   echo ""
 }
 
@@ -1305,6 +1306,26 @@ cmd_status() {
   echo ""
 }
 
+cmd_info() {
+  local image_name
+  image_name=$(ic image "$IMAGE" | jq -r '.name // empty')
+  [[ -n "$image_name" ]] || image_name="$IMAGE"
+
+  echo ""
+  printf "  ${C_BOLD}%-16s${C_RST} %s\n" "Config file:"    "$CONFIG_FILE"
+  printf "  ${C_BOLD}%-16s${C_RST} %s\n" "Region / zone:" "$REGION / $ZONE"
+  printf "  ${C_BOLD}%-16s${C_RST} %s\n" "Resource group:" "$RG_NAME"
+  printf "  ${C_BOLD}%-16s${C_RST} %s\n" "VPC:"            "$VPC_NAME"
+  printf "  ${C_BOLD}%-16s${C_RST} %s\n" "Subnet:"         "$SUBNET_NAME"
+  printf "  ${C_BOLD}%-16s${C_RST} %s\n" "SSH key:"        "$KEY_NAME ($SSH_KEY_FILE)"
+  printf "  ${C_BOLD}%-16s${C_RST} %s\n" "Access group:"   "$ACCESS_SG_NAME"
+  printf "  ${C_BOLD}%-16s${C_RST} %s\n" "Profile:"        "$PROFILE"
+  printf "  ${C_BOLD}%-16s${C_RST} %s\n" "SSH user:"       "$SSH_USER"
+  printf "  ${C_BOLD}%-16s${C_RST} %s\n" "Image:"          "$image_name"
+  printf "  ${C_BOLD}%-16s${C_RST} %s\n" "Image ID:"       "$IMAGE"
+  echo ""
+}
+
 # ── Help ──────────────────────────────────────────────────────────────────────
 usage() {
   cat <<EOF
@@ -1324,6 +1345,7 @@ ${C_BOLD}COMMANDS${C_RST}
   ssh     <name>      SSH into a VM (starts it first if stopped, auto-allows your IP)
   list                List all VMs in the resource group
   status  <name>      Show VM details
+  info                Show configured infrastructure and create defaults
 
 ${C_BOLD}ACCESS${C_RST}  (manage which IPs can SSH to your VMs)
   access list         Show currently allowed IPs
@@ -1345,6 +1367,7 @@ ${C_BOLD}EXAMPLES${C_RST}
   ibmvm rm myvm                        # removes ibmvm-myvm
   ibmvm rm --all                       # removes all ibmvm-* instances
   ibmvm list
+  ibmvm info                           # show configured infrastructure and defaults
 
 ${C_BOLD}CONFIG${C_RST}  ~/.ibmvm/config.<account-id>  (managed by ibmvm setup)
 
@@ -1392,6 +1415,8 @@ main() {
              cmd_list ;;
     status)  [[ $# -ge 1 ]] || die "Usage: ibmvm status <name>"
              cmd_status "$1" ;;
+    info)    [[ $# -eq 0 ]] || die "ibmvm info takes no arguments"
+             cmd_info ;;
     access)  cmd_access "$@" ;;
     *)       die "Unknown command: '${cmd}'  (run 'ibmvm help' for usage)" ;;
   esac

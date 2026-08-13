@@ -400,6 +400,16 @@ case "$cmd" in
                {"id":"img-ubuntu-002","name":"ibm-ubuntu-22-04-3-minimal-amd64-1","status":"available"}]'
         ;;
 
+      # image <id>
+      image)
+        id="${pargs[0]:-}"
+        case "$id" in
+          img-ubuntu-001) echo '{"id":"img-ubuntu-001","name":"ibm-ubuntu-24-04-1-minimal-amd64-1"}' ;;
+          img-ubuntu-002) echo '{"id":"img-ubuntu-002","name":"ibm-ubuntu-22-04-3-minimal-amd64-1"}' ;;
+          *) echo "{\"id\":\"${id}\",\"name\":\"${id}\"}" ;;
+        esac
+        ;;
+
       # instance-profiles — list available profiles
       instance-profiles)
         echo '[{"name":"bx2-2x8"},{"name":"bx2-4x8"},{"name":"bx2-4x16"},{"name":"cx2-4x8"},{"name":"cx2-8x16"},{"name":"mx2-2x16"}]'

@@ -27,6 +27,7 @@ ibmvm rm      --all     Remove all ibmvm-* VMs (optionally tears down infra)
 ibmvm list              List all VMs
 ibmvm status  <name>    Show VM details
 ibmvm create  <name>    Explicitly create a VM
+ibmvm info              Show configured infrastructure and create defaults
 ```
 
 VM names are automatically prefixed with `ibmvm-` — so `ibmvm start myvm` creates `ibmvm-myvm`.
@@ -67,3 +68,5 @@ ibmvm rm --all                           # remove all VMs
 ## Config
 
 Settings are stored per IBM Cloud account in `~/.ibmvm/config.<account-id>`, managed by `ibmvm setup`.
+
+Run `ibmvm info` to see the active region, VPC, subnet, SSH key, access security group, and the profile and image that new VMs will use.
