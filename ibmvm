@@ -693,14 +693,29 @@ get_instance_status() {
 
 get_primary_nic_id() {
   local data; data=$(get_instance_json "$1")
-  echo "$data" | jq -r '.primary_network_interface.id // empty'
+  # Instances using network attachments expose a compatibility
+  # primary_network_interface whose ID is actually the attachment ID. That ID
+  # cannot be used as a network-interface target, so only use this legacy path
+  # when the instance has no VNI-backed primary attachment.
+  echo "$data" | jq -r 'if .primary_network_attachment.virtual_network_interface.id then empty else .primary_network_interface.id // empty end'
+}
+
+get_primary_vni_id() {
+  local data; data=$(get_instance_json "$1")
+  echo "$data" | jq -r '.primary_network_attachment.virtual_network_interface.id // empty'
 }
 
 get_floating_ip() {
-  local nic_id; nic_id=$(get_primary_nic_id "$1")
-  [[ -n "$nic_id" ]] || return 0
-  ic instance-network-interface-floating-ips "$1" "$nic_id" \
-    | jq -r '.[0].address // empty'
+  local vni_id; vni_id=$(get_primary_vni_id "$1")
+  if [[ -n "$vni_id" ]]; then
+    ic virtual-network-interface-floating-ips "$vni_id" \
+      | jq -r '.[0].address // empty'
+  else
+    local nic_id; nic_id=$(get_primary_nic_id "$1")
+    [[ -n "$nic_id" ]] || return 0
+    ic instance-network-interface-floating-ips "$1" "$nic_id" \
+      | jq -r '.[0].address // empty'
+  fi
 }
 
 wait_for_status() {
@@ -818,15 +833,23 @@ assign_floating_ip() {
     echo "$existing"; return
   fi
 
-  local nic_id; nic_id=$(get_primary_nic_id "$name")
-  [[ -n "$nic_id" ]] || die "Could not find primary NIC for '${name}'"
-
   local fip_json
-  fip_json=$(ibmcloud is floating-ip-reserve "$fip_name" \
-    --nic "$nic_id" --in "$name" \
-    --resource-group-name "$RG_NAME" \
-    --output JSON -q) \
-    || die "Failed to reserve floating IP"
+  local vni_id; vni_id=$(get_primary_vni_id "$name")
+  if [[ -n "$vni_id" ]]; then
+    fip_json=$(ibmcloud is floating-ip-reserve "$fip_name" \
+      --vni "$vni_id" \
+      --resource-group-name "$RG_NAME" \
+      --output JSON -q) \
+      || die "Failed to reserve floating IP"
+  else
+    local nic_id; nic_id=$(get_primary_nic_id "$name")
+    [[ -n "$nic_id" ]] || die "Could not find primary NIC for '${name}'"
+    fip_json=$(ibmcloud is floating-ip-reserve "$fip_name" \
+      --nic "$nic_id" --in "$name" \
+      --resource-group-name "$RG_NAME" \
+      --output JSON -q) \
+      || die "Failed to reserve floating IP"
+  fi
   echo "$fip_json" | jq -r '.address'
 }
 
@@ -963,11 +986,18 @@ cmd_create() {
 
   local access_sg; access_sg=$(access_sg_id)
   if [[ -n "$access_sg" ]]; then
-    local nic_id; nic_id=$(get_primary_nic_id "$vm")
-    if [[ -n "$nic_id" ]]; then
-      ibmcloud is security-group-target-add "$access_sg" "$nic_id" \
-        --output JSON -q > /dev/null \
+    local vni_id; vni_id=$(get_primary_vni_id "$vm")
+    if [[ -n "$vni_id" ]]; then
+      ibmcloud is security-group-target-add "$access_sg" "$vni_id" \
+        --trt virtual_network_interface --output JSON -q > /dev/null \
         || log_warn "Could not attach access security group (SSH access rules may not apply)"
+    else
+      local nic_id; nic_id=$(get_primary_nic_id "$vm")
+      if [[ -n "$nic_id" ]]; then
+        ibmcloud is security-group-target-add "$access_sg" "$nic_id" \
+          --output JSON -q > /dev/null \
+          || log_warn "Could not attach access security group (SSH access rules may not apply)"
+      fi
     fi
   fi
 

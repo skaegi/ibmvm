@@ -11,6 +11,21 @@ load helpers
   [[ "$output" == *"IP:"* ]]
 }
 
+@test "create: uses the VNI for security groups and floating IPs on network-attachment instances" {
+  mock_infra
+  mock_vni_networking
+  mock_access_sg
+  write_config 'IMAGE="r006-abc123"'
+  ibmvm create myvm
+  [ "$status" -eq 0 ]
+  assert_called "security-group-target-add.*vni-ibmvm-myvm.*--trt virtual_network_interface"
+  assert_called "floating-ip-reserve ibmvm-myvm-fip --vni vni-ibmvm-myvm"
+  ibmvm status myvm
+  [ "$status" -eq 0 ]
+  assert_called "virtual-network-interface-floating-ips vni-ibmvm-myvm"
+  refute_called "instance-network-interface-floating-ips"
+}
+
 @test "create: uses default profile bx2-2x8" {
   mock_infra
   ibmvm create myvm

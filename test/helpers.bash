@@ -68,6 +68,15 @@ mock_instance() {
   echo "$name"   > "$IBMVM_MOCK_DIR/instance_$(slug "$name")_name"
 }
 
+# Make mock instance responses use IBM's network-attachment/VNI model.
+mock_vni_networking() {
+  touch "$IBMVM_MOCK_DIR/vni_networking"
+}
+
+mock_access_sg() {
+  touch "$IBMVM_MOCK_DIR/access_sg"
+}
+
 # Assign a floating IP to a mock instance.
 mock_fip() {
   local name="$1" ip="${2:-1.2.3.4}"

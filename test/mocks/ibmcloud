@@ -55,6 +55,13 @@ get_flag() {
 
 instance_json() {
   local name="$1" status="$2"
+  if [[ -f "$D/vni_networking" ]]; then
+    printf '{"id":"i-%s","name":"%s","status":"%s",' "$name" "$name" "$status"
+    printf '"primary_network_interface":{"id":"attachment-%s","name":"eth0"},' "$name"
+    printf '"primary_network_attachment":{"id":"attachment-%s","virtual_network_interface":{"id":"vni-%s","name":"vni-%s"}}' "$name" "$name" "$name"
+    printf '}'
+    return
+  fi
   printf '{"id":"i-%s","name":"%s","status":"%s","profile":{"name":"bx2-2x4"},' \
          "$name" "$name" "$status"
   printf '"zone":{"name":"us-south-1"},'
@@ -224,6 +231,19 @@ case "$cmd" in
         fi
         ;;
 
+      # virtual-network-interface-floating-ips <vni>
+      virtual-network-interface-floating-ips)
+        vni="${pargs[0]:-}"
+        instance="${vni#vni-}"
+        fip_file="$D/instance_$(slug "$instance")_fip"
+        if [[ -f "$fip_file" ]]; then
+          addr=$(cat "$fip_file")
+          echo "[{\"id\":\"fip-id\",\"address\":\"${addr}\",\"name\":\"${instance}-fip\"}]"
+        else
+          echo "[]"
+        fi
+        ;;
+
       # floating-ips — list all floating IPs
       floating-ips)
         first=true
@@ -259,10 +279,14 @@ case "$cmd" in
         fi
         ;;
 
-      # floating-ip-reserve <fip-name> --nic NIC --in INSTANCE ...
+      # floating-ip-reserve <fip-name> --nic NIC --in INSTANCE ... | --vni VNI
       floating-ip-reserve)
         fip_name="${pargs[0]:-}"
         instance=$(get_flag --in "$@")
+        if [[ -z "$instance" ]]; then
+          vni=$(get_flag --vni "$@")
+          instance="${vni#vni-}"
+        fi
         addr="1.2.3.$(( RANDOM % 200 + 10 ))"
         [[ -n "$instance" ]] && echo "$addr" > "$D/instance_$(slug "$instance")_fip"
         echo "{\"id\":\"fip-id\",\"address\":\"${addr}\",\"name\":\"${fip_name}\"}"
@@ -431,6 +455,10 @@ case "$cmd" in
           echo -n "{\"id\":\"sg-${vpc_slug}\",\"name\":\"${vpc_name}-sg\",\"vpc\":{\"name\":\"${vpc_name}\"}}"
           first=false
         done
+        if [[ -f "$D/access_sg" ]]; then
+          $first || echo -n ","
+          echo -n '{"id":"sg-access","name":"ibmvm-access"}'
+        fi
         echo "]"
         ;;
 
